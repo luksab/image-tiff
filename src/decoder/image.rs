@@ -158,7 +158,7 @@ impl Image {
         };
 
         let bits_per_sample = match samples {
-            1 | 3 | 4 => tag_reader
+            1 | 3 | 4 | 5 => tag_reader
                 .find_tag_uint_vec(Tag::BitsPerSample)?
                 .unwrap_or_else(|| vec![1]),
             _ => return Err(TiffUnsupportedError::UnsupportedSampleDepth(samples).into()),
@@ -299,6 +299,7 @@ impl Image {
             },
             PhotometricInterpretation::CMYK => match self.bits_per_sample[..] {
                 [c, m, y, k] if [c, c, c] == [m, y, k] => Ok(ColorType::CMYK(c)),
+                [c, m, y, k, a] if [c, c, c, c] == [m, y, k, a] => Ok(ColorType::CMYKA(c)),
                 _ => Err(TiffError::UnsupportedError(
                     TiffUnsupportedError::InterpretationWithBits(
                         self.photometric_interpretation,
@@ -466,6 +467,7 @@ impl Image {
             | (ColorType::RGBA(n), _)
             | (ColorType::CMYK(n), _)
             | (ColorType::Gray(n), _)
+            | (ColorType::CMYKA(n), _)
                 if usize::from(n) == buffer.byte_len() * 8 => {}
             (ColorType::Gray(n), DecodingBuffer::U8(_)) if n < 8 => match self.predictor {
                 Predictor::None => {}
