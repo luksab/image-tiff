@@ -128,6 +128,8 @@ pub enum Tag(u16) unknown("A private or extension tag") {
     GeoDoubleParamsTag = 34736, // (SPOT)
     GeoAsciiParamsTag = 34737, // (SPOT)
     GdalNodata = 42113, // Contains areas with missing data
+    // Private tags
+    ICCProfile = 34675, // (Adobe)
 }
 }
 
