@@ -32,12 +32,11 @@ impl TileAttributes {
         (self.image_height + self.tile_length - 1) / self.tile_length
     }
     fn padding_right(&self) -> usize {
-        self.tile_width - self.image_width % self.tile_width
+        (self.tile_width - self.image_width % self.tile_width) % self.tile_width
     }
     fn padding_down(&self) -> usize {
-        self.tile_length - self.image_height % self.tile_length
+        (self.tile_length - self.image_height % self.tile_length) % self.tile_length
     }
-
     pub fn get_padding(&self, tile: usize) -> (usize, usize) {
         let row = tile / self.tiles_across();
         let column = tile % self.tiles_across();
@@ -110,8 +109,7 @@ impl Image {
         // Try to parse both the compression method and the number, format, and bits of the included samples.
         // If they are not explicitly specified, those tags are reset to their default values and not carried from previous images.
         let compression_method = match tag_reader.find_tag(Tag::Compression)? {
-            Some(val) => CompressionMethod::from_u16(val.into_u16()?)
-                .ok_or(TiffUnsupportedError::UnknownCompressionMethod)?,
+            Some(val) => CompressionMethod::from_u16_exhaustive(val.into_u16()?),
             None => CompressionMethod::None,
         };
 
@@ -306,6 +304,15 @@ impl Image {
                     ),
                 )),
             },
+            PhotometricInterpretation::YCbCr => match self.bits_per_sample[..] {
+                [y, cb, cr] if [y, y] == [cb, cr] => Ok(ColorType::YCbCr(y)),
+                _ => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::InterpretationWithBits(
+                        self.photometric_interpretation,
+                        self.bits_per_sample.clone(),
+                    ),
+                )),
+            },
             PhotometricInterpretation::BlackIsZero | PhotometricInterpretation::WhiteIsZero
                 if self.bits_per_sample.len() == 1 =>
             {
@@ -458,6 +465,7 @@ impl Image {
         output_width: usize,
         byte_order: ByteOrder,
         chunk_index: u32,
+        limits: &Limits,
     ) -> TiffResult<()> {
         // Validate that the provided buffer is of the expected type.
         let color_type = self.colortype()?;
@@ -465,6 +473,7 @@ impl Image {
             (ColorType::RGB(n), _)
             | (ColorType::RGBA(n), _)
             | (ColorType::CMYK(n), _)
+            | (ColorType::YCbCr(n), _)
             | (ColorType::Gray(n), _)
                 if usize::from(n) == buffer.byte_len() * 8 => {}
             (ColorType::Gray(n), DecodingBuffer::U8(_)) if n < 8 => match self.predictor {
@@ -511,6 +520,9 @@ impl Image {
                 .ok_or(TiffError::FormatError(
                     TiffFormatError::InconsistentSizesEncountered,
                 ))?;
+        if *compressed_bytes > limits.intermediate_buffer_size as u64 {
+            return Err(TiffError::LimitsExceeded);
+        }
 
         let byte_len = buffer.byte_len();
         let compression_method = self.compression_method;
