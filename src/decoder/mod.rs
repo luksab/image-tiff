@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::io::{self, Read, Seek};
-use std::ops::Range;
+use std::ops::{Range, RangeFrom};
 
 use crate::{
     bytecast, ColorType, TiffError, TiffFormatError, TiffResult, TiffUnsupportedError, UsageError,
@@ -167,6 +167,21 @@ pub enum DecodingBuffer<'a> {
 }
 
 impl<'a> DecodingBuffer<'a> {
+    fn len(&self) -> usize {
+        match self {
+            DecodingBuffer::U8(buf) => buf.len(),
+            DecodingBuffer::U16(buf) => buf.len(),
+            DecodingBuffer::U32(buf) => buf.len(),
+            DecodingBuffer::U64(buf) => buf.len(),
+            DecodingBuffer::F32(buf) => buf.len(),
+            DecodingBuffer::F64(buf) => buf.len(),
+            DecodingBuffer::I8(buf) => buf.len(),
+            DecodingBuffer::I16(buf) => buf.len(),
+            DecodingBuffer::I32(buf) => buf.len(),
+            DecodingBuffer::I64(buf) => buf.len(),
+        }
+    }
+
     fn byte_len(&self) -> usize {
         match *self {
             DecodingBuffer::U8(_) => 1,
@@ -201,6 +216,24 @@ impl<'a> DecodingBuffer<'a> {
     }
 
     fn subrange<'b>(&'b mut self, range: Range<usize>) -> DecodingBuffer<'b>
+    where
+        'a: 'b,
+    {
+        match *self {
+            DecodingBuffer::U8(ref mut buf) => DecodingBuffer::U8(&mut buf[range]),
+            DecodingBuffer::U16(ref mut buf) => DecodingBuffer::U16(&mut buf[range]),
+            DecodingBuffer::U32(ref mut buf) => DecodingBuffer::U32(&mut buf[range]),
+            DecodingBuffer::U64(ref mut buf) => DecodingBuffer::U64(&mut buf[range]),
+            DecodingBuffer::F32(ref mut buf) => DecodingBuffer::F32(&mut buf[range]),
+            DecodingBuffer::F64(ref mut buf) => DecodingBuffer::F64(&mut buf[range]),
+            DecodingBuffer::I8(ref mut buf) => DecodingBuffer::I8(&mut buf[range]),
+            DecodingBuffer::I16(ref mut buf) => DecodingBuffer::I16(&mut buf[range]),
+            DecodingBuffer::I32(ref mut buf) => DecodingBuffer::I32(&mut buf[range]),
+            DecodingBuffer::I64(ref mut buf) => DecodingBuffer::I64(&mut buf[range]),
+        }
+    }
+
+    fn subrange_from<'b>(&'b mut self, range: RangeFrom<usize>) -> DecodingBuffer<'b>
     where
         'a: 'b,
     {
@@ -1132,6 +1165,71 @@ impl<R: Read + Seek + Send> Decoder<R> {
         }
     }
 
+    fn check_result_buf(
+        &self,
+        width: usize,
+        height: usize,
+        buf: &DecodingBuffer,
+    ) -> TiffResult<()> {
+        let buffer_size = match width
+            .checked_mul(height)
+            .and_then(|x| x.checked_mul(self.image().bits_per_sample.len()))
+        {
+            Some(s) => s,
+            None => return Err(TiffError::LimitsExceeded),
+        };
+
+        let max_sample_bits = self
+            .image()
+            .bits_per_sample
+            .iter()
+            .cloned()
+            .max()
+            .unwrap_or(8);
+
+        if buf.len() != buffer_size {
+            return Err(TiffError::FormatError(
+                TiffFormatError::InconsistentSizesEncountered,
+            ));
+        }
+        match self
+            .image()
+            .sample_format
+            .first()
+            .unwrap_or(&SampleFormat::Uint)
+        {
+            SampleFormat::Uint => match max_sample_bits {
+                n if n <= 8 => Ok(()),
+                n if n <= 16 => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::UnsupportedBitsPerChannel(n),
+                )),
+                n => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::UnsupportedBitsPerChannel(n),
+                )),
+            },
+            SampleFormat::IEEEFP => match max_sample_bits {
+                32 => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::UnsupportedDataType,
+                )),
+                n => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::UnsupportedBitsPerChannel(n),
+                )),
+            },
+            SampleFormat::Int => match max_sample_bits {
+                // n if n <= 8 => DecodingResult::new_i8(buffer_size, &self.limits),
+                // n if n <= 16 => DecodingResult::new_i16(buffer_size, &self.limits),
+                // n if n <= 32 => DecodingResult::new_i32(buffer_size, &self.limits),
+                // n if n <= 64 => DecodingResult::new_i64(buffer_size, &self.limits),
+                n => Err(TiffError::UnsupportedError(
+                    TiffUnsupportedError::UnsupportedBitsPerChannel(n),
+                )),
+            },
+            format => {
+                Err(TiffUnsupportedError::UnsupportedSampleFormat(vec![format.clone()]).into())
+            }
+        }
+    }
+
     /// Read the specified chunk (at index `chunk_index`) and return the binary data as a Vector.
     pub fn read_chunk(&mut self, chunk_index: u32) -> TiffResult<DecodingResult> {
         let data_dims = self.image().chunk_data_dimensions(chunk_index)?;
@@ -1316,5 +1414,166 @@ impl<R: Read + Seek + Send> Decoder<R> {
         }
 
         Ok(result)
+    }
+
+    /// Decodes the entire image into the provided buffer.
+    pub fn read_image_buf(&mut self, mut buf: DecodingBuffer) -> TiffResult<()> {
+        let width = self.image().width;
+        let height = self.image().height;
+        self.check_result_buf(width as usize, height as usize, &buf)?;
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+
+        let chunk_dimensions = self.image().chunk_dimensions()?;
+        let chunk_dimensions = (
+            chunk_dimensions.0.min(width),
+            chunk_dimensions.1.min(height),
+        );
+        if chunk_dimensions.0 == 0 || chunk_dimensions.1 == 0 {
+            return Err(TiffError::FormatError(
+                TiffFormatError::InconsistentSizesEncountered,
+            ));
+        }
+
+        let samples = self.image().bits_per_sample.len();
+        if samples == 0 {
+            return Err(TiffError::FormatError(
+                TiffFormatError::InconsistentSizesEncountered,
+            ));
+        }
+
+        let chunks_across = ((width - 1) / chunk_dimensions.0 + 1) as usize;
+        let strip_samples = width as usize * chunk_dimensions.1 as usize * samples;
+
+        // Parallel decode. Requires the "rayon" feature, the presence of multiple vertical chunks
+        // in the image, and that all chunks are at most half the limit for intermediate buffer size.
+        if height > chunk_dimensions.1
+            && self
+                .image()
+                .chunk_bytes
+                .iter()
+                .all(|&b| b <= self.limits.intermediate_buffer_size as u64 / 2)
+        {
+            let condvar = std::sync::Condvar::new();
+            let bytes_allocated = std::sync::Mutex::new(Ok(0));
+
+            // Loop over columns of chunks (for stripped images `chunks_across` is always 1).
+            //
+            // This iteration is needed to work around an annoying lifetime issue for tiled images:
+            // each tile of an image will map to potentially thousands of non-contiguous ranges in
+            // the output buffer. So instead of getting mutable references to a single tile, we
+            // take a mutable refence to a entire row of tiles (which do fit within a single
+            // contiguous range) and on each iteration only access the x-th tile in the row.
+            for x in 0..chunks_across {
+                rayon::in_place_scope_fifo(|s| -> TiffResult<()> {
+                    let buffer_offset = x * chunk_dimensions.0 as usize * samples;
+                    // Iterate over rows of chunks. For stripped images, `strip` will be the y-th
+                    // strip of the image. While for tiled images, `strip` will be the memory for
+                    // the entire y-th row of tiles so the loop body will be careful to only access
+                    // the parts corresponding to tile (x,y).
+                    for (y, strip) in buf
+                        .subrange_from(buffer_offset..)
+                        .chunks_mut(strip_samples)
+                        .enumerate()
+                    {
+                        let chunk = y * chunks_across + x;
+                        let (offset, size) = self.image.chunk_file_range(chunk as u32)?;
+
+                        // Block until there is enough memory left.
+                        //
+                        // We called in_place_scope_fifo, so this blocking operation is happening
+                        // on the calling thread, *not* on one of rayon's worker threads. Further,
+                        // we don't take any other locks or do any blocking operations while the
+                        // bytes_allocated lock is held (the `wait_while` operations releases the
+                        // lock while waiting), so this code will never disrupt forward progress
+                        // for other threads that try to acquire the lock.
+                        {
+                            let l = bytes_allocated.lock().unwrap();
+                            let mut l = condvar
+                                .wait_while(l, |l| match *l {
+                                    Err(_) => false,
+                                    Ok(bytes_allocated) => {
+                                        bytes_allocated + size as usize
+                                            > self.limits.intermediate_buffer_size
+                                    }
+                                })
+                                .unwrap();
+                            match *l {
+                                Ok(ref mut bytes_allocated) => *bytes_allocated += size as usize,
+                                Err(_) => return Ok(()),
+                            }
+                        }
+
+                        // Read chunk contents from file.
+                        //
+                        // This read call will run in parallel with prior spawned rayon tasks,
+                        // which is desirable because reading chunks from a file is a
+                        // potentially slow operation.
+                        self.reader.seek(io::SeekFrom::Start(offset))?;
+                        let mut chunk_contents = Vec::new();
+                        (&mut self.reader)
+                            .take(size)
+                            .read_to_end(&mut chunk_contents)?;
+
+                        // Spawn a task to expand the chunk.
+                        let condvar = &condvar;
+                        let mutex = &bytes_allocated;
+                        let image = &self.image;
+                        let byte_order = self.reader.byte_order;
+                        let limits = &self.limits;
+                        s.spawn_fifo(move |_| {
+                            // Do chunk expansion.
+                            let ret = image.expand_chunk(
+                                std::io::Cursor::new(&chunk_contents),
+                                strip,
+                                width as usize,
+                                byte_order,
+                                chunk as u32,
+                                limits,
+                            );
+
+                            // Propogate result to main thread. This code doesn't do any blocking
+                            // operations while the lock is held, so it cannot deadlock.
+                            match (ret, &mut *mutex.lock().unwrap()) {
+                                (Err(e), mutex) => *mutex = Err(e),
+                                (Ok(_), Ok(ref mut bytes_allocated)) => {
+                                    *bytes_allocated -= chunk_contents.len();
+                                    drop(chunk_contents);
+                                }
+                                (Ok(_), _) => {}
+                            }
+                            condvar.notify_one();
+                        });
+                    }
+                    Ok(())
+                })?;
+
+                // If we encountered any errors on this strip, return now.
+                std::mem::replace(&mut *bytes_allocated.lock().unwrap(), Ok(0))?;
+            }
+            return Ok(());
+        }
+
+        // Sequential decode.
+
+        for chunk in 0..self.image().chunk_offsets.len() {
+            self.goto_offset_u64(self.image().chunk_offsets[chunk])?;
+
+            let x = chunk % chunks_across;
+            let y = chunk / chunks_across;
+            let buffer_offset = y * strip_samples + x * chunk_dimensions.0 as usize * samples;
+            let byte_order = self.reader.byte_order;
+            self.image.expand_chunk(
+                &mut self.reader,
+                buf.subrange_from(buffer_offset..).copy(),
+                width as usize,
+                byte_order,
+                chunk as u32,
+                &self.limits,
+            )?;
+        }
+
+        Ok(())
     }
 }
